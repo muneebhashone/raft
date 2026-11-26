@@ -1302,13 +1302,33 @@ func (r *Raft) processLogs(index uint64, futures map[uint64]*logFuture) {
 	}
 
 	applyBatch := func(batch []*commitTuple) {
-		select {
-		case r.fsmMutateCh <- batch:
-		case <-r.shutdownCh:
-			for _, cl := range batch {
-				if cl.future != nil {
-					cl.future.respond(ErrRaftShutdown)
+		// fsmMutateCh is buffered, so this send blocks once the FSM falls behind.
+		// takeSnapshot holds the caller's FSM snapshot while it waits on
+		// configurationsCh, and only this thread answers that channel. Serve
+		// the read here so a snapshot can finish even when Apply is waiting
+		// for the snapshot to be released. The committed configuration is
+		// updated before processLogs, on both the leader and follower paths.
+		for {
+			select {
+			case r.fsmMutateCh <- batch:
+				return
+			case c := <-r.configurationsCh:
+				// leaderLoop rejects this read during a leadership transfer.
+				// Followers and candidates do not, and applyBatch runs there too.
+				if r.getState() == Leader && r.getLeadershipTransferInProgress() {
+					r.logger.Debug(ErrLeadershipTransferInProgress.Error())
+					c.respond(ErrLeadershipTransferInProgress)
+					continue
 				}
+				c.configurations = r.configurations.Clone()
+				c.respond(nil)
+			case <-r.shutdownCh:
+				for _, cl := range batch {
+					if cl.future != nil {
+						cl.future.respond(ErrRaftShutdown)
+					}
+				}
+				return
 			}
 		}
 	}
